@@ -461,6 +461,10 @@ window.addEventListener('load', async () => {
   setInterval(loadLeaderboard, 60000);
   handleHash();
   window.addEventListener('hashchange', handleHash);
+  
+  if (window.lucide) {
+    lucide.createIcons();
+  }
 });
 
 function handleHash() {
@@ -597,11 +601,65 @@ function buildGroupForm() {
         <span class="group-chevron">▼</span>
       </div>
       <div class="group-body" id="gb-${g.id}">
-        ${matchIds.map(mid => buildMatchRow(mid)).join('')}
+        <div class="group-content-split">
+          <div class="group-matches-col">
+            ${matchIds.map(mid => buildMatchRow(mid)).join('')}
+          </div>
+          <div class="group-standings-col" id="gs-table-container-${g.id}">
+            <!-- Standings rendered dynamically here -->
+          </div>
+        </div>
       </div>
     `;
     container.appendChild(div);
+    renderGroupStandings(g.id);
   });
+}
+
+function renderGroupStandings(groupId) {
+  const container = document.getElementById('gs-table-container-' + groupId);
+  if (!container) return;
+  const standings = computeGroupStandings(groupId);
+
+  let html = `
+    <div class="group-standings-card">
+      <div class="standings-header-row">Predicted Standings</div>
+      <table class="standings-table">
+        <thead>
+          <tr>
+            <th style="width:24px">#</th>
+            <th>Team</th>
+            <th style="text-align:center;width:30px">GD</th>
+            <th style="text-align:center;width:30px">Pts</th>
+          </tr>
+        </thead>
+        <tbody>
+  `;
+
+  standings.forEach((teamRow, idx) => {
+    const pos = idx + 1;
+    let qualifyClass = 'qualify-other';
+    if (pos === 1) qualifyClass = 'qualify-1';
+    else if (pos === 2) qualifyClass = 'qualify-2';
+
+    html += `
+      <tr class="${qualifyClass}">
+        <td><span class="standings-pos-badge pos-${pos}">${pos}</span></td>
+        <td style="font-weight:600">${escHtml(teamRow.team)}</td>
+        <td style="text-align:center;font-weight:600;color:${teamRow.gd > 0 ? 'var(--green)' : teamRow.gd < 0 ? 'var(--red)' : 'var(--muted)'}">
+          ${teamRow.gd > 0 ? '+' + teamRow.gd : teamRow.gd}
+        </td>
+        <td style="text-align:center;font-weight:700">${teamRow.pts}</td>
+      </tr>
+    `;
+  });
+
+  html += `
+        </tbody>
+      </table>
+    </div>
+  `;
+  container.innerHTML = html;
 }
 
 function buildMatchRow(mid) {
@@ -632,11 +690,17 @@ function toggleGroup(id) {
 function onScoreInput(mid) {
   saveProgress();
   checkGroupComplete(mid);
+  
+  // Re-render standings for this group
+  const groupId = Object.keys(GROUP_MATCH_IDS).find(g => GROUP_MATCH_IDS[g].includes(mid));
+  if (groupId) renderGroupStandings(groupId);
+  
   clearInvalidPicks();   // group predictions changed, invalidate stale KO picks
   renderKOBracket();
   updateTotalProgress();
 }
 
+let previouslyCompleted = false;
 function updateTotalProgress() {
   let gsFilled = 0;
   for (let i = 1; i <= 72; i++) {
@@ -647,9 +711,46 @@ function updateTotalProgress() {
   const koPicked = Object.keys(koPicks).filter(k => koPicks[k]).length;
   const total = gsFilled + koPicked;
   const pct = Math.round(total / 104 * 100);
-  document.getElementById('prog-bar').style.width = pct + '%';
-  document.getElementById('progress-text').textContent =
-    `${gsFilled}/72 group · ${koPicked}/32 knockout (${total}/104 total)`;
+  
+  const progBar = document.getElementById('prog-bar');
+  if (progBar) progBar.style.width = pct + '%';
+  
+  const progText = document.getElementById('progress-text');
+  if (progText) progText.textContent = `${pct}% (${total}/104)`;
+  
+  const progSub = document.getElementById('progress-subtext');
+  if (progSub) {
+    if (total === 104) {
+      progSub.innerHTML = '🔥 <span style="color:var(--gold);font-weight:700;">Ready to submit! Click "Submit All 104 Predictions" below!</span>';
+    } else {
+      progSub.textContent = `${gsFilled}/72 group · ${koPicked}/32 knockout matches completed.`;
+    }
+  }
+
+  // Update milestones
+  const msGroups = document.getElementById('ms-groups');
+  const msKos = document.getElementById('ms-kos');
+  const msReady = document.getElementById('ms-ready');
+  if (msGroups) msGroups.classList.toggle('reached', gsFilled === 72);
+  if (msKos) msKos.classList.toggle('reached', koPicked === 32);
+  if (msReady) msReady.classList.toggle('reached', total === 104);
+
+  // Confetti trigger on total completeness
+  if (total === 104 && !previouslyCompleted) {
+    previouslyCompleted = true;
+    confetti({
+      particleCount: 120,
+      spread: 75,
+      origin: { y: 0.65 },
+      colors: ['#ffd700', '#00e676', '#00f0ff', '#ec4899', '#ffffff']
+    });
+    const submitBtn = document.getElementById('submit-btn');
+    if (submitBtn) submitBtn.classList.add('pulse-glow');
+  } else if (total < 104) {
+    previouslyCompleted = false;
+    const submitBtn = document.getElementById('submit-btn');
+    if (submitBtn) submitBtn.classList.remove('pulse-glow');
+  }
 }
 
 function checkGroupComplete(mid) {
@@ -693,7 +794,10 @@ function restoreProgress() {
       if (hs && sc.h !== '') hs.value = sc.h;
       if (as && sc.a !== '') as.value = sc.a;
     }
-    Object.keys(GROUP_MATCH_IDS).forEach(g => checkGroupComplete(GROUP_MATCH_IDS[g][0]));
+    Object.keys(GROUP_MATCH_IDS).forEach(g => {
+      checkGroupComplete(GROUP_MATCH_IDS[g][0]);
+      renderGroupStandings(g);
+    });
   } catch(e) {}
 }
 
@@ -896,6 +1000,27 @@ function onKoPick(mid, team) {
   saveKOProgress();
   renderKOBracket();
   updateTotalProgress();
+  
+  // Champion pick confetti!
+  if (mid === 104) {
+    confetti({
+      particleCount: 100,
+      spread: 60,
+      origin: { y: 0.85 },
+      colors: ['#ffd700', '#00e676', '#00f0ff', '#ec4899']
+    });
+  }
+}
+
+let activeKORound = 'R32';
+function switchKORound(roundId) {
+  activeKORound = roundId;
+  document.querySelectorAll('.ko-round-tab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.round === roundId);
+  });
+  document.querySelectorAll('.ko-round-section').forEach(sec => {
+    sec.classList.toggle('active', sec.id === 'ko-round-sec-' + roundId);
+  });
 }
 
 function renderKOBracket() {
@@ -903,10 +1028,22 @@ function renderKOBracket() {
   if (!container) return;
 
   let html = '';
+  
+  // Update counts on the badges
+  for (const roundInfo of KO_ROUNDS_INFO) {
+    const { round, ids } = roundInfo;
+    let filled = 0;
+    for (const mid of ids) {
+      if (koPicks[mid]) filled++;
+    }
+    const badge = document.getElementById(`badge-${round}`);
+    if (badge) badge.textContent = `${filled}/${ids.length}`;
+  }
 
   for (const roundInfo of KO_ROUNDS_INFO) {
     const { round, ids, label, pts } = roundInfo;
-    html += `<div class="ko-round-section">
+    const isActive = round === activeKORound;
+    html += `<div class="ko-round-section${isActive ? ' active' : ''}" id="ko-round-sec-${round}">
       <div class="ko-round-header">
         <span>${label}</span>
         <span class="ko-round-pts">${pts} pt${pts !== 1 ? 's' : ''} per correct pick</span>
@@ -946,6 +1083,10 @@ function renderKOBracket() {
   </div>`;
 
   container.innerHTML = html;
+  
+  if (window.lucide) {
+    lucide.createIcons();
+  }
 }
 
 // ─── Email Check ──────────────────────────────────────────────────────────────
@@ -1015,37 +1156,58 @@ async function submitAll() {
 }
 
 // ─── Leaderboard ──────────────────────────────────────────────────────────────
+let leaderboardData = [];
 async function loadLeaderboard() {
   const content = document.getElementById('lb-content');
   try {
     const r = await fetch('/api/leaderboard');
-    const data = await r.json();
+    leaderboardData = await r.json();
     document.getElementById('lb-updated').textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+    renderLeaderboardTable(leaderboardData);
+  } catch(e) {
+    content.innerHTML = '<div class="empty-state">Failed to load leaderboard.</div>';
+  }
+}
 
-    if (!data.length) {
-      content.innerHTML = '<div class="empty-state"><div class="icon">🏆</div><div>No predictions submitted yet.</div></div>';
-      return;
-    }
+function filterLeaderboard() {
+  const query = document.getElementById('lb-search').value.toLowerCase().trim();
+  const filtered = leaderboardData.filter(p => p.name.toLowerCase().includes(query));
+  renderLeaderboardTable(filtered);
+}
 
-    const rows = data.map(p => `
-      <tr>
-        <td class="rank-cell ${p.rank<=3?'rank-'+p.rank:''}">${p.rank}</td>
+function renderLeaderboardTable(data) {
+  const content = document.getElementById('lb-content');
+  if (!data.length) {
+    content.innerHTML = '<div class="empty-state"><div class="icon">🏆</div><div>No players found.</div></div>';
+    return;
+  }
+
+  const rows = data.map(p => {
+    let rankBadge = p.rank;
+    if (p.rank === 1) rankBadge = '🥇';
+    else if (p.rank === 2) rankBadge = '🥈';
+    else if (p.rank === 3) rankBadge = '🥉';
+
+    const selfEmail = localStorage.getItem(LS_EMAIL) || '';
+    const isSelf = p.email && selfEmail && p.email.toLowerCase() === selfEmail.toLowerCase();
+
+    return `
+      <tr class="${isSelf ? 'lb-row-self' : ''}">
+        <td class="rank-cell ${p.rank<=3?'rank-'+p.rank:''}">${rankBadge}</td>
         <td style="font-weight:600">${escHtml(p.name)}</td>
         <td class="pts-total">${p.total_points}</td>
         <td><span class="sub-pts">GS: ${p.gs_points}</span></td>
         <td><span class="sub-pts">KO: ${p.ko_points}</span></td>
       </tr>
-    `).join('');
-
-    content.innerHTML = `
-      <table class="lb-table">
-        <thead><tr><th>#</th><th>Player</th><th>Total</th><th>Group Stage</th><th>Knockout</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
     `;
-  } catch(e) {
-    content.innerHTML = '<div class="empty-state">Failed to load leaderboard.</div>';
-  }
+  }).join('');
+
+  content.innerHTML = `
+    <table class="lb-table">
+      <thead><tr><th>#</th><th>Player</th><th>Total</th><th>Group Stage</th><th>Knockout</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
 }
 
 // ─── Bracket (real tournament results) ───────────────────────────────────────
@@ -1137,17 +1299,118 @@ async function loadMyScore() {
   }
 }
 
+function getPredictedChampionPath(predictions) {
+  const koPreds = {};
+  predictions.forEach(p => {
+    if (p.match_id >= 73) {
+      koPreds[p.match_id] = p.predicted_winner;
+    }
+  });
+
+  const champion = koPreds[104];
+  if (!champion) return null;
+
+  const path = [];
+  let currentTeam = champion;
+  let currentMatchId = 104;
+
+  while (currentMatchId) {
+    const pred = predictions.find(p => p.match_id === currentMatchId);
+    if (!pred) break;
+
+    path.unshift({
+      match_id: currentMatchId,
+      round: pred.round,
+      predicted_winner: currentTeam,
+      home_team: pred.home_team,
+      away_team: pred.away_team,
+      status: pred.status,
+      points: pred.points,
+      actual_home: pred.actual_home,
+      actual_away: pred.actual_away,
+      actual_pen: pred.actual_pen
+    });
+
+    const feeds = KO_FEEDS[currentMatchId];
+    if (!feeds) break;
+
+    let nextMatchId = null;
+    for (const feed of feeds) {
+      const feedId = Math.abs(feed);
+      if (koPreds[feedId] === currentTeam) {
+        nextMatchId = feedId;
+        break;
+      }
+    }
+    currentMatchId = nextMatchId;
+  }
+
+  return path;
+}
+
 function renderMyScore(d) {
   const content = document.getElementById('ms-content');
   const gsPreds = d.predictions.filter(p => p.round === 'GS');
 
   let html = `
     <div id="my-summary">
-      <div class="stat-box"><div class="val">${d.total}</div><div class="lbl">Total Points</div></div>
-      <div class="stat-box"><div class="val">${d.gs_total ?? 0}</div><div class="lbl">Group Stage</div></div>
-      <div class="stat-box"><div class="val">${d.ko_total ?? 0}</div><div class="lbl">Knockout</div></div>
+      <div class="stat-box box-total"><div class="val">${d.total}</div><div class="lbl">Total Points</div></div>
+      <div class="stat-box box-gs"><div class="val">${d.gs_total ?? 0}</div><div class="lbl">Group Stage</div></div>
+      <div class="stat-box box-ko"><div class="val">${d.ko_total ?? 0}</div><div class="lbl">Knockout</div></div>
     </div>
   `;
+
+  // predicted champion timeline path
+  const path = getPredictedChampionPath(d.predictions);
+  if (path && path.length > 0) {
+    const champ = path[path.length - 1].predicted_winner;
+    html += `
+      <div class="card champion-path-card">
+        <div class="card-title" style="margin-bottom:6px"><i data-lucide="compass" style="width:16px;height:16px"></i> Path of Predicted Champion (${escHtml(champ)})</div>
+        <div class="text-muted" style="margin-bottom:12px;font-size:11px;">Traces predictions for your champion from Round of 32 to the final trophy.</div>
+        <div class="champion-path-timeline">
+    `;
+    
+    path.forEach(node => {
+      const isFin = node.status === 'FINISHED';
+      let statusClass = 'tbd';
+      let actualText = '';
+      
+      if (isFin) {
+        let actualWinner = null;
+        if (node.actual_home != null && node.actual_away != null) {
+          if (node.actual_home > node.actual_away) actualWinner = node.home_team;
+          else if (node.actual_away > node.actual_home) actualWinner = node.away_team;
+          else actualWinner = node.actual_pen;
+        }
+        
+        if (actualWinner && node.predicted_winner === actualWinner) {
+          statusClass = 'correct';
+          actualText = ` <span style="color:var(--green);font-weight:700;">✓ Correct</span>`;
+        } else {
+          statusClass = 'incorrect';
+          actualText = ` <span style="color:var(--red);font-weight:700;">✗ Wrong</span> (Winner: ${escHtml(actualWinner || 'TBD')})`;
+        }
+      }
+      
+      const roundLabel = ROUND_LABELS[node.round] || node.round;
+      
+      html += `
+        <div class="timeline-node ${statusClass}">
+          <div class="timeline-round">${roundLabel}</div>
+          <div class="timeline-matchup">
+            Picked <span class="picked-team">${escHtml(node.predicted_winner)}</span> to win Match #${node.match_id}
+            ${actualText}
+          </div>
+        </div>
+      `;
+    });
+    
+    html += `
+        </div>
+      </div>
+    `;
+  }
 
   // Group stage by group
   for (const g of GROUPS) {
@@ -1188,7 +1451,7 @@ function renderMyScore(d) {
 
   const koPreds = d.predictions.filter(p => p.match_id >= 73);
   if (koPreds.length) {
-    html += '<div class="card"><div class="card-title">Knockout Predictions</div>';
+    html += '<div class="card"><div class="card-title"><i data-lucide="network" style="width:16px;height:16px"></i> Knockout Predictions</div>';
     for (const { round, min, max, label, pts } of koRoundsDisplay) {
       const preds = koPreds.filter(p => p.match_id >= min && p.match_id <= max);
       if (!preds.length) continue;
@@ -1227,6 +1490,10 @@ function renderMyScore(d) {
   }
 
   content.innerHTML = html;
+  
+  if (window.lucide) {
+    lucide.createIcons();
+  }
 }
 
 function ptsBadge(pts) {
