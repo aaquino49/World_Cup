@@ -1,5 +1,34 @@
 # Deployment Guide — WC 2026 Predictor
 
+## Current Status
+
+As of June 8, 2026, the Railway deployment has been created, required environment variables have been added, and a persistent Volume is mounted at `/data`.
+
+The next step is not initial deployment. The next step is live validation:
+
+1. Visit `https://your-app.railway.app/api/status`.
+2. Confirm `submissionOpen: true`.
+3. Confirm `apiConfigured: true`.
+4. Visit `https://your-app.railway.app/#admin` and log in.
+5. Click **Sync API** in Admin.
+6. Submit one complete test bracket.
+7. Confirm the test player appears in Leaderboard, My Score, and Admin > Players.
+8. Manually finish one group-stage match in Admin and confirm scoring updates.
+9. Restart or redeploy the service and confirm the test player still exists.
+10. Delete the test player after validation.
+
+If the test player remains after restart/redeploy, the `/data` volume and `DB_PATH=/data/worldcup.db` are working correctly.
+
+## UI Update Process
+
+A Claude Design document is expected before the next UI pass. Once received:
+
+1. Compare the design document against `../UI_OVERVIEW.md` and `public/index.html`.
+2. Implement the agreed UI changes in `public/index.html`.
+3. Preserve existing API routes, scoring, and submission behavior unless explicitly changing them.
+4. Test locally, then redeploy to Railway.
+5. Re-run the live validation checklist above.
+
 ## Quick Start (Railway)
 
 ### 1. Get a football-data.org API key
