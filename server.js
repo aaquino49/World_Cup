@@ -143,8 +143,8 @@ const GROUP_MATCHES = [
   { id: 72, group: 'L', date: '2026-06-27', home: 'Croatia',         away: 'Ghana' },
 ];
 
-// Knockout bracket structure (teams are TBD until groups complete)
-// Seeds use group+position notation: A1=group A winner, 3rd=qualifying 3rd-place team
+// Knockout bracket structure (teams TBD until groups complete).
+// 8 of 12 third-place teams qualify; they fill the 8 "3rd" slots in R32.
 const KO_MATCHES = [
   // Round of 32 (Jun 28 – Jul 1)
   { id: 73,  round: 'R32',   slot: 'A2 v B2',  date: '2026-06-28', feeds_from: [] },
@@ -162,7 +162,7 @@ const KO_MATCHES = [
   { id: 85,  round: 'R32',   slot: 'B1 v 3rd', date: '2026-07-01', feeds_from: [] },
   { id: 86,  round: 'R32',   slot: 'J1 v H2',  date: '2026-07-01', feeds_from: [] },
   { id: 87,  round: 'R32',   slot: 'K2 v L2',  date: '2026-07-01', feeds_from: [] },
-  { id: 88,  round: 'R32',   slot: 'G2 v B2',  date: '2026-07-01', feeds_from: [] },
+  { id: 88,  round: 'R32',   slot: 'G2 v 3rd', date: '2026-07-01', feeds_from: [] },
   // Round of 16 (Jul 2–5)
   { id: 89,  round: 'R16',   slot: 'W73 v W74', date: '2026-07-02', feeds_from: [73, 74] },
   { id: 90,  round: 'R16',   slot: 'W75 v W76', date: '2026-07-02', feeds_from: [75, 76] },
@@ -180,7 +180,7 @@ const KO_MATCHES = [
   // Semi-finals (Jul 11–12)
   { id: 101, round: 'SF',    slot: 'W97 v W98',   date: '2026-07-11', feeds_from: [97, 98] },
   { id: 102, round: 'SF',    slot: 'W99 v W100',  date: '2026-07-12', feeds_from: [99, 100] },
-  // 3rd place (Jul 18)
+  // 3rd place (Jul 18) — losers of semis
   { id: 103, round: '3RD',   slot: 'L101 v L102', date: '2026-07-18', feeds_from: [101, 102] },
   // Final (Jul 19)
   { id: 104, round: 'FINAL', slot: 'W101 v W102', date: '2026-07-19', feeds_from: [101, 102] },
@@ -231,13 +231,14 @@ function initDB() {
     );
 
     CREATE TABLE IF NOT EXISTS predictions (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      player_id     INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
-      match_id      INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
-      home_score    INTEGER NOT NULL,
-      away_score    INTEGER NOT NULL,
-      pen_winner    TEXT,
-      submitted_at  TEXT DEFAULT (datetime('now')),
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      player_id        INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+      match_id         INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+      home_score       INTEGER NOT NULL DEFAULT 0,
+      away_score       INTEGER NOT NULL DEFAULT 0,
+      pen_winner       TEXT,
+      predicted_winner TEXT,
+      submitted_at     TEXT DEFAULT (datetime('now')),
       UNIQUE(player_id, match_id)
     );
 
@@ -253,6 +254,9 @@ function initDB() {
       value TEXT
     );
   `);
+
+  // Migrate existing DB if predicted_winner column not yet present
+  try { db.exec('ALTER TABLE predictions ADD COLUMN predicted_winner TEXT'); } catch(e) {}
 
   // Seed group stage matches
   const insertMatch = db.prepare(`
@@ -280,7 +284,7 @@ function scoreGroupMatch(predHome, predAway, actualHome, actualAway) {
   if (predHome == null || predAway == null) return 0;
   if (actualHome == null || actualAway == null) return 0;
 
-  const predOutcome = Math.sign(predHome - predAway);
+  const predOutcome   = Math.sign(predHome - predAway);
   const actualOutcome = Math.sign(actualHome - actualAway);
 
   if (predOutcome !== actualOutcome) return 0;
@@ -296,15 +300,10 @@ function matchWinner(match) {
   return match.pen_winner || null;
 }
 
-function predictedWinner(pred, match) {
-  if (pred.home_score > pred.away_score) return match.home_team;
-  if (pred.away_score > pred.home_score) return match.away_team;
-  return pred.pen_winner || null;
-}
-
+// Per-match GS scoring stored in player_points
 function recalculateMatchPoints(matchId) {
   const match = db.prepare('SELECT * FROM matches WHERE id = ?').get(matchId);
-  if (!match || match.status !== 'FINISHED') return;
+  if (!match || match.status !== 'FINISHED' || match.round !== 'GS') return;
 
   const preds = db.prepare('SELECT * FROM predictions WHERE match_id = ?').all(matchId);
   const upsert = db.prepare(`
@@ -313,25 +312,67 @@ function recalculateMatchPoints(matchId) {
   `);
 
   for (const pred of preds) {
-    let pts = 0;
-    if (match.round === 'GS') {
-      pts = scoreGroupMatch(pred.home_score, pred.away_score, match.home_score, match.away_score);
-    } else {
-      const actualW = matchWinner(match);
-      const predW = predictedWinner(pred, match);
-      if (actualW && predW && actualW === predW) {
-        pts = KO_ROUND_PTS[match.round] || 0;
-        if (match.round === 'FINAL') pts += CHAMPION_BONUS;
-      }
-    }
+    const pts = scoreGroupMatch(pred.home_score, pred.away_score, match.home_score, match.away_score);
     upsert.run(pred.player_id, matchId, pts);
   }
 }
 
-// Recalculate all points (used after admin result changes)
+// KO scoring is set-based: player earns pts for each predicted winner that actually won that round.
+// Computed on demand; nothing stored in player_points for KO rounds.
+function getKOPoints(playerId) {
+  const koRounds = [
+    { round: 'R32',   minId: 73,  maxId: 88  },
+    { round: 'R16',   minId: 89,  maxId: 96  },
+    { round: 'QF',    minId: 97,  maxId: 100 },
+    { round: 'SF',    minId: 101, maxId: 102 },
+    { round: '3RD',   minId: 103, maxId: 103 },
+    { round: 'FINAL', minId: 104, maxId: 104 },
+  ];
+
+  let total = 0;
+  const breakdown = {};
+
+  for (const { round, minId, maxId } of koRounds) {
+    const actualMatches = db.prepare(
+      `SELECT * FROM matches WHERE id BETWEEN ? AND ? AND status = 'FINISHED'`
+    ).all(minId, maxId);
+
+    if (!actualMatches.length) { breakdown[round] = 0; continue; }
+
+    const actualWinners = new Set(actualMatches.map(m => matchWinner(m)).filter(Boolean));
+    const roundPts = KO_ROUND_PTS[round];
+
+    const playerPreds = db.prepare(
+      `SELECT predicted_winner FROM predictions WHERE player_id = ? AND match_id BETWEEN ? AND ?`
+    ).all(playerId, minId, maxId);
+    const playerWinners = new Set(playerPreds.map(p => p.predicted_winner).filter(Boolean));
+
+    let pts = 0;
+    for (const team of playerWinners) {
+      if (actualWinners.has(team)) pts += roundPts;
+    }
+
+    // Champion bonus: player correctly predicted the Final winner
+    if (round === 'FINAL' && actualMatches.length > 0) {
+      const champion = matchWinner(actualMatches[0]);
+      const finalPred = db.prepare(
+        `SELECT predicted_winner FROM predictions WHERE player_id = ? AND match_id = 104`
+      ).get(playerId);
+      if (champion && finalPred?.predicted_winner === champion) pts += CHAMPION_BONUS;
+    }
+
+    breakdown[round] = pts;
+    total += pts;
+  }
+
+  return { total, breakdown };
+}
+
+// Recalculate all GS points (used after admin result changes)
 function recalculateAll() {
-  const finished = db.prepare("SELECT id FROM matches WHERE status = 'FINISHED'").all();
+  const finished = db.prepare("SELECT id FROM matches WHERE status = 'FINISHED' AND round = 'GS'").all();
   for (const m of finished) recalculateMatchPoints(m.id);
+  // KO points are on-demand via getKOPoints(); no storage needed.
 }
 
 // ─── football-data.org Sync ─────────────────────────────────────────────────────
@@ -359,7 +400,6 @@ async function syncFromAPI() {
       const status = am.status;
       const apiRound = API_STAGE_MAP[am.stage] || null;
 
-      // Find internal match: first by api_id, then by teams (for GS)
       let dbMatch = db.prepare('SELECT * FROM matches WHERE api_id = ?').get(apiId);
 
       if (!dbMatch && apiRound === 'GS' && homeTeam && awayTeam) {
@@ -369,9 +409,7 @@ async function syncFromAPI() {
         if (dbMatch) db.prepare('UPDATE matches SET api_id = ? WHERE id = ?').run(apiId, dbMatch.id);
       }
 
-      // For KO rounds, link to our pre-created shells or create new
       if (!dbMatch && apiRound && apiRound !== 'GS' && homeTeam && homeTeam !== 'TBD') {
-        // Try to find an unlinked shell in the right round with TBD teams
         dbMatch = db.prepare(`
           SELECT * FROM matches WHERE round = ? AND api_id IS NULL AND home_team = 'TBD' LIMIT 1
         `).get(apiRound);
@@ -379,9 +417,8 @@ async function syncFromAPI() {
       }
 
       if (!dbMatch) continue;
-      if (dbMatch.manual) continue; // Don't override manual entries
+      if (dbMatch.manual) continue;
 
-      // Update team names for KO rounds once known
       if (homeTeam && awayTeam && homeTeam !== 'TBD' && awayTeam !== 'TBD') {
         db.prepare('UPDATE matches SET home_team = ?, away_team = ? WHERE id = ?')
           .run(homeTeam, awayTeam, dbMatch.id);
@@ -405,7 +442,9 @@ async function syncFromAPI() {
           WHERE id = ?
         `).run(hs, as, penWinner, dbMatch.id);
 
-        recalculateMatchPoints(dbMatch.id);
+        if (dbMatch.round === 'GS') recalculateMatchPoints(dbMatch.id);
+        // KO points recomputed on demand via getKOPoints()
+
       } else {
         db.prepare("UPDATE matches SET status = ? WHERE id = ? AND status != 'FINISHED'")
           .run(status, dbMatch.id);
@@ -418,9 +457,7 @@ async function syncFromAPI() {
   }
 }
 
-// Poll every 5 minutes
 cron.schedule('*/5 * * * *', syncFromAPI);
-// Also sync at startup (non-blocking)
 setTimeout(syncFromAPI, 3000);
 
 // ─── Express App ────────────────────────────────────────────────────────────────
@@ -451,19 +488,27 @@ function isSubmissionOpen() {
 
 function getLeaderboard() {
   const players = db.prepare(`
-    SELECT p.id, p.name, p.email,
-           COALESCE(SUM(pp.points), 0) AS total_points,
-           COALESCE(SUM(CASE WHEN m.round = 'GS' THEN pp.points ELSE 0 END), 0) AS gs_points,
-           COALESCE(SUM(CASE WHEN m.round != 'GS' THEN pp.points ELSE 0 END), 0) AS ko_points
+    SELECT p.id, p.name,
+           COALESCE(SUM(pp.points), 0) AS gs_points
     FROM players p
     LEFT JOIN player_points pp ON pp.player_id = p.id
-    LEFT JOIN matches m ON m.id = pp.match_id
     WHERE p.gs_submitted = 1
     GROUP BY p.id
-    ORDER BY total_points DESC, gs_points DESC, p.name ASC
   `).all();
 
-  return players.map((p, i) => ({ ...p, rank: i + 1, email: undefined }));
+  return players
+    .map(p => {
+      const ko = getKOPoints(p.id);
+      return {
+        id: p.id,
+        name: p.name,
+        gs_points: p.gs_points,
+        ko_points: ko.total,
+        total_points: p.gs_points + ko.total,
+      };
+    })
+    .sort((a, b) => b.total_points - a.total_points || b.gs_points - a.gs_points || a.name.localeCompare(b.name))
+    .map((p, i) => ({ ...p, rank: i + 1 }));
 }
 
 function getPlayerDetail(playerId) {
@@ -482,16 +527,23 @@ function getPlayerDetail(playerId) {
     ORDER BY m.id
   `).all(playerId);
 
-  const total = preds.reduce((s, p) => s + p.points, 0);
+  const gsTotal = preds.filter(p => p.round === 'GS').reduce((s, p) => s + p.points, 0);
+  const ko = getKOPoints(playerId);
 
-  return { player: { id: player.id, name: player.name, email: player.email }, predictions: preds, total };
+  return {
+    player: { id: player.id, name: player.name, email: player.email },
+    predictions: preds,
+    gs_total: gsTotal,
+    ko_total: ko.total,
+    ko_breakdown: ko.breakdown,
+    total: gsTotal + ko.total,
+  };
 }
 
 // ─── Public Routes ───────────────────────────────────────────────────────────────
 
-// Status / health
 app.get('/api/status', (req, res) => {
-  const matchCount = db.prepare('SELECT COUNT(*) AS n FROM matches WHERE status = ?').get('FINISHED').n;
+  const matchCount  = db.prepare('SELECT COUNT(*) AS n FROM matches WHERE status = ?').get('FINISHED').n;
   const playerCount = db.prepare('SELECT COUNT(*) AS n FROM players WHERE gs_submitted = 1').get().n;
   res.json({
     submissionOpen: isSubmissionOpen(),
@@ -503,18 +555,14 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// All matches (schedule + results)
 app.get('/api/matches', (req, res) => {
-  const matches = db.prepare('SELECT * FROM matches ORDER BY id').all();
-  res.json(matches);
+  res.json(db.prepare('SELECT * FROM matches ORDER BY id').all());
 });
 
-// Leaderboard
 app.get('/api/leaderboard', (req, res) => {
   res.json(getLeaderboard());
 });
 
-// Check if email already submitted (for duplicate prevention UI)
 app.get('/api/check-email', (req, res) => {
   const email = (req.query.email || '').trim().toLowerCase();
   if (!email) return res.status(400).json({ error: 'Email required' });
@@ -522,7 +570,6 @@ app.get('/api/check-email', (req, res) => {
   res.json({ exists: !!player, submitted: player?.gs_submitted === 1, name: player?.name || null });
 });
 
-// Player score lookup (by email)
 app.get('/api/my-score', (req, res) => {
   const email = (req.query.email || '').trim().toLowerCase();
   if (!email) return res.status(400).json({ error: 'Email required' });
@@ -531,62 +578,80 @@ app.get('/api/my-score', (req, res) => {
   res.json(getPlayerDetail(player.id));
 });
 
-// Submit group stage predictions
-app.post('/api/submit/group', (req, res) => {
+// Submit all 104 predictions at once (72 group stage + 32 knockout).
+// Group predictions: { match_id, home_score, away_score }
+// KO predictions:    { match_id, predicted_winner }
+app.post('/api/submit', (req, res) => {
   if (!isSubmissionOpen()) {
     return res.status(403).json({ error: 'Submission window is closed.' });
   }
 
   const { name, email, predictions } = req.body;
   if (!name || !email) return res.status(400).json({ error: 'Name and email are required.' });
-  if (!Array.isArray(predictions) || predictions.length !== 72) {
-    return res.status(400).json({ error: 'All 72 group stage predictions are required.' });
+  if (!Array.isArray(predictions) || predictions.length !== 104) {
+    return res.status(400).json({ error: 'All 104 predictions are required (72 group stage + 32 knockout).' });
   }
 
   const emailClean = email.trim().toLowerCase();
 
-  // Validate scores
-  for (const p of predictions) {
+  // Validate group stage predictions (match_id 1–72)
+  const gsPreds = predictions.filter(p => p.match_id >= 1 && p.match_id <= 72);
+  if (gsPreds.length !== 72) {
+    return res.status(400).json({ error: 'All 72 group stage match scores are required.' });
+  }
+  for (const p of gsPreds) {
     if (!Number.isInteger(p.home_score) || !Number.isInteger(p.away_score)) {
       return res.status(400).json({ error: `Invalid score for match ${p.match_id}` });
     }
     if (p.home_score < 0 || p.away_score < 0 || p.home_score > 20 || p.away_score > 20) {
       return res.status(400).json({ error: `Score out of range for match ${p.match_id}` });
     }
-    if (p.match_id < 1 || p.match_id > 72) {
-      return res.status(400).json({ error: `Invalid match_id ${p.match_id}` });
+  }
+
+  // Validate knockout predictions (match_id 73–104)
+  const koPreds = predictions.filter(p => p.match_id >= 73 && p.match_id <= 104);
+  if (koPreds.length !== 32) {
+    return res.status(400).json({ error: 'All 32 knockout match predictions are required.' });
+  }
+  for (const p of koPreds) {
+    if (!p.predicted_winner || typeof p.predicted_winner !== 'string' || !p.predicted_winner.trim()) {
+      return res.status(400).json({ error: `Missing predicted_winner for knockout match ${p.match_id}` });
     }
   }
 
   const submitTx = db.transaction(() => {
-    // Upsert player (allow name update; block re-submission)
     let player = db.prepare('SELECT * FROM players WHERE email = ?').get(emailClean);
-    if (player && player.gs_submitted) {
-      throw new Error('ALREADY_SUBMITTED');
-    }
+    if (player && player.gs_submitted) throw new Error('ALREADY_SUBMITTED');
+
     if (!player) {
-      const result = db.prepare(
-        'INSERT INTO players (name, email) VALUES (?, ?)'
-      ).run(name.trim(), emailClean);
+      const result = db.prepare('INSERT INTO players (name, email) VALUES (?, ?)').run(name.trim(), emailClean);
       player = db.prepare('SELECT * FROM players WHERE id = ?').get(result.lastInsertRowid);
     } else {
       db.prepare('UPDATE players SET name = ? WHERE id = ?').run(name.trim(), player.id);
     }
 
-    // Insert predictions
-    const insertPred = db.prepare(`
+    // Store group stage predictions (with home/away scores)
+    const insertGS = db.prepare(`
       INSERT OR REPLACE INTO predictions (player_id, match_id, home_score, away_score)
       VALUES (?, ?, ?, ?)
     `);
-    for (const p of predictions) {
-      insertPred.run(player.id, p.match_id, p.home_score, p.away_score);
+    for (const p of gsPreds) {
+      insertGS.run(player.id, p.match_id, p.home_score, p.away_score);
     }
 
-    // Mark group stage as submitted
+    // Store knockout predictions (with predicted_winner; scores default to 0)
+    const insertKO = db.prepare(`
+      INSERT OR REPLACE INTO predictions (player_id, match_id, home_score, away_score, predicted_winner)
+      VALUES (?, ?, 0, 0, ?)
+    `);
+    for (const p of koPreds) {
+      insertKO.run(player.id, p.match_id, p.predicted_winner.trim());
+    }
+
     db.prepare("UPDATE players SET gs_submitted = 1, gs_submitted_at = datetime('now') WHERE id = ?")
       .run(player.id);
 
-    // Score any already-finished matches
+    // Score any already-finished GS matches immediately
     const finishedGS = db.prepare("SELECT id FROM matches WHERE round = 'GS' AND status = 'FINISHED'").all();
     for (const m of finishedGS) recalculateMatchPoints(m.id);
 
@@ -598,49 +663,16 @@ app.post('/api/submit/group', (req, res) => {
     res.json({ success: true, playerId: player.id, name: player.name });
   } catch (err) {
     if (err.message === 'ALREADY_SUBMITTED') {
-      return res.status(409).json({ error: 'You have already submitted your group stage predictions.' });
+      return res.status(409).json({ error: 'You have already submitted your predictions.' });
     }
     console.error(err);
     res.status(500).json({ error: 'Server error. Please try again.' });
   }
 });
 
-// Submit a knockout round prediction
-app.post('/api/submit/knockout', (req, res) => {
-  const { email, match_id, home_score, away_score, pen_winner } = req.body;
-  if (!email || !match_id) return res.status(400).json({ error: 'Email and match_id required.' });
-
-  const emailClean = email.trim().toLowerCase();
-  const player = db.prepare('SELECT * FROM players WHERE email = ?').get(emailClean);
-  if (!player || !player.gs_submitted) {
-    return res.status(403).json({ error: 'You must submit group stage predictions first.' });
-  }
-
-  const match = db.prepare('SELECT * FROM matches WHERE id = ?').get(match_id);
-  if (!match || match.round === 'GS') return res.status(400).json({ error: 'Invalid match.' });
-  if (match.status === 'FINISHED') return res.status(403).json({ error: 'Match already finished.' });
-  if (match.home_team === 'TBD' || match.away_team === 'TBD') {
-    return res.status(403).json({ error: 'Teams not yet determined for this match.' });
-  }
-
-  if (!Number.isInteger(home_score) || !Number.isInteger(away_score)) {
-    return res.status(400).json({ error: 'Invalid scores.' });
-  }
-
-  // If predicted draw, penalty winner required
-  if (home_score === away_score && !pen_winner) {
-    return res.status(400).json({ error: 'Penalty winner required for predicted draw.' });
-  }
-  if (pen_winner && pen_winner !== match.home_team && pen_winner !== match.away_team) {
-    return res.status(400).json({ error: 'Invalid penalty winner.' });
-  }
-
-  db.prepare(`
-    INSERT OR REPLACE INTO predictions (player_id, match_id, home_score, away_score, pen_winner)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(player.id, match_id, home_score, away_score, pen_winner || null);
-
-  res.json({ success: true });
+// Backward-compat alias (old clients sent only 72 GS predictions)
+app.post('/api/submit/group', (req, res) => {
+  res.status(400).json({ error: 'Please use /api/submit with all 104 predictions (group stage + knockout).' });
 });
 
 // ─── Admin Routes ─────────────────────────────────────────────────────────────────
@@ -652,38 +684,37 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ token });
 });
 
-// All players & submission status
 app.get('/api/admin/players', adminAuth, (req, res) => {
   const players = db.prepare(`
-    SELECT p.*, COALESCE(SUM(pp.points), 0) AS total_points
+    SELECT p.*, COALESCE(SUM(pp.points), 0) AS gs_points
     FROM players p
     LEFT JOIN player_points pp ON pp.player_id = p.id
     GROUP BY p.id
-    ORDER BY total_points DESC, p.name
+    ORDER BY p.name
   `).all();
-  res.json(players);
+  // Add KO points for admin view
+  const result = players.map(p => {
+    const ko = getKOPoints(p.id);
+    return { ...p, ko_points: ko.total, total_points: p.gs_points + ko.total };
+  });
+  res.json(result);
 });
 
-// All predictions for a player (admin view)
 app.get('/api/admin/player/:id', adminAuth, (req, res) => {
   const detail = getPlayerDetail(parseInt(req.params.id));
   if (!detail) return res.status(404).json({ error: 'Player not found.' });
   res.json(detail);
 });
 
-// Delete a player and their predictions
 app.delete('/api/admin/player/:id', adminAuth, (req, res) => {
   db.prepare('DELETE FROM players WHERE id = ?').run(parseInt(req.params.id));
   res.json({ success: true });
 });
 
-// Get all results (admin view, includes unplayed)
 app.get('/api/admin/matches', adminAuth, (req, res) => {
-  const matches = db.prepare('SELECT * FROM matches ORDER BY id').all();
-  res.json(matches);
+  res.json(db.prepare('SELECT * FROM matches ORDER BY id').all());
 });
 
-// Manually set a match result
 app.put('/api/admin/match/:id', adminAuth, (req, res) => {
   const matchId = parseInt(req.params.id);
   const { home_score, away_score, pen_winner, status } = req.body;
@@ -705,18 +736,16 @@ app.put('/api/admin/match/:id', adminAuth, (req, res) => {
     matchId
   );
 
-  if (newStatus === 'FINISHED') recalculateMatchPoints(matchId);
+  if (newStatus === 'FINISHED' && match.round === 'GS') recalculateMatchPoints(matchId);
 
   res.json({ success: true });
 });
 
-// Clear a manual override (let API take over again)
 app.delete('/api/admin/match/:id/override', adminAuth, (req, res) => {
   db.prepare('UPDATE matches SET manual = 0 WHERE id = ?').run(parseInt(req.params.id));
   res.json({ success: true });
 });
 
-// Update KO match teams (when admin knows who plays who before API updates)
 app.put('/api/admin/match/:id/teams', adminAuth, (req, res) => {
   const { home_team, away_team } = req.body;
   if (!home_team || !away_team) return res.status(400).json({ error: 'Both teams required.' });
@@ -725,19 +754,17 @@ app.put('/api/admin/match/:id/teams', adminAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// Trigger manual API sync
 app.post('/api/admin/sync', adminAuth, async (req, res) => {
   await syncFromAPI();
   res.json({ success: true, lastSync: lastSyncAt });
 });
 
-// Recalculate all scores (safety net)
 app.post('/api/admin/recalculate', adminAuth, (req, res) => {
   recalculateAll();
   res.json({ success: true });
 });
 
-// ─── Catch-all: serve index.html for any non-API route ──────────────────────────
+// ─── Catch-all ───────────────────────────────────────────────────────────────────
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Not found' });
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
