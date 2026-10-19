@@ -37,7 +37,7 @@ A Claude Design document is expected before the next UI pass. Once received:
 
 ### 2. Push to GitHub
 ```bash
-cd "C:\Users\alexa\OneDrive\Desktop\Claude Projects\World_Cup\web-app"
+cd World_Cup
 git init
 git add .
 git commit -m "Initial commit"
